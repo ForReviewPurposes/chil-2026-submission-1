@@ -1,0 +1,569 @@
+---
+output: 
+  html_document
+---
+
+
+```{r, message=FALSE}
+
+library(here)
+library(tibble)
+
+source(here("src","cv_assets.R"))
+source(here("src","bcw_train_test_split.R"))
+
+set.seed(42)
+
+
+```
+
+# 1. Dataset 1: BCW
+
+
+```{r}
+
+dev <- read.csv(here("src","data","bcw","dev.csv"))
+dev <- dev[,-1]
+dev$diagnosis <- as.factor(dev$diagnosis)
+
+```
+
+
+## Class overlap and hidden failures
+
+```{r}
+
+ggplot(dev%>%filter(worst_perimeter >= 50 & worst_perimeter <= 150)) +
+  geom_point(aes(x=worst_perimeter, y=worst_area, color=diagnosis), alpha=0.8) +
+  labs(title="Class Overlap in the BCW dataset") +
+  theme_minimal()
+
+```
+
+```{r}
+
+nrow(dev%>%filter(worst_perimeter >= 50 & worst_perimeter <= 105))
+
+```
+
+```{r}
+
+folds <- make_strat_folds(dev$diagnosis, k = 5, seed = 42)
+
+```
+
+## Baseline Performance Comparison
+
+```{r}
+
+rf_base <- rf_cv_build_calibration_stack(dev, folds=folds, mtry=8, min.node.size=5, num_trees = 500)
+
+```
+
+```{r}
+
+rf_case_weights <- rf_cv_build_calibration_stack_weighted(dev, folds=folds, mtry=8, min.node.size=5, num_trees = 500,
+                                                          weight_col="worst_perimeter", lo=65, hi=110,
+                                                          w_zone_all=2, w_zone_malignant=5)
+
+```
+
+```{r}
+
+xgboost_base <- xgb_oof_predict(dev, folds=folds)
+
+```
+
+```{r}
+
+patchwork::wrap_plots(
+
+  ggplot(rf_base%>%filter(pM < 0.4, diagnosis=="M")) +
+    geom_histogram(aes(x=pM), fill="skyblue") +
+    ylab("True Malignants") +
+    labs(title="False Negatives:\nRandom Forest Base") +
+    theme_minimal(),
+  
+  ggplot(rf_case_weights%>%filter(pM < 0.4, diagnosis=="M")) +
+    geom_histogram(aes(x=pM), fill="skyblue") +
+    ylab("True Malignants") +
+    labs(title="\nRF w/ Case Weights in\nworst_perimeter [65,110]") +
+    theme_minimal(),
+  
+  ggplot(xgboost_base%>%filter(pM < 0.4, diagnosis=="M")) +
+    geom_histogram(aes(x=pM), fill="skyblue") +
+    ylab("True Malignants") +
+    labs(title="\nXGBoost Base") +
+    theme_minimal(),
+  
+  nrow=2, ncol=2
+)
+
+
+```
+
+
+
+
+## Five-fold Cross Validation Loop for RF output and Risk Signals
+
+```{r}
+
+calibration_z_stack <- rf_cv_build_calibration_stack(
+  dev = dev,
+  folds = folds,
+  mtry = 8,
+  min.node.size = 5,
+  seed = 42,
+  verbose = TRUE
+)
+
+
+```
+
+```{r}
+
+patchwork::wrap_plots(
+  ggplot(data=calibration_z_stack%>%filter(d_dist < 80)) +
+  geom_point(aes(x=qlogis(pM), y=d_dist, color=diagnosis), alpha=0.8) +
+  xlab("") +
+  ylab("d_dist") +
+  labs(title="d_dist and proj_marg vs logit(pM)") +
+  theme_minimal(),
+  
+  ggplot(data=calibration_z_stack) +
+  geom_point(aes(x=qlogis(pM), y=proj_marg, color=diagnosis), alpha=0.8) +
+  xlab("logit(pM)") +
+  ylab("proj_marg") +
+  theme_minimal(),
+  
+  nrow=2
+)
+
+```
+
+
+```{r}
+
+ggplot(data=calibration_z_stack) +
+  geom_histogram(aes(x=pM, fill=diagnosis), alpha=0.8) +
+  labs(title="pM (RF probability of Malignancy)") +
+  theme_minimal()
+
+ggplot(data=calibration_z_stack%>%filter(d_dist < 80)) +
+  geom_point(aes(x=qlogis(pM), y=d_dist, color=diagnosis), alpha=0.8) +
+  xlab("logit(pM)") +
+  ylab("d_dist") +
+  labs(title="d_dist vs logit(pM)") +
+  theme_minimal()
+
+ggplot(data=calibration_z_stack) +
+  geom_point(aes(x=qlogis(pM), y=proj_marg, color=diagnosis), alpha=0.8) +
+  xlab("logit(pM)") +
+  ylab("Marg. Z Proj.") +
+  labs(title="logit(pM) vs Marg. Z Proj.") +
+  theme_minimal()
+
+ggplot(data=calibration_z_stack%>%filter(d_dist < 80)) +
+  geom_point(aes(x=d_dist, y=proj_marg, color=diagnosis), alpha=0.8) +
+  xlab("d_dist") +
+  ylab("proj_marg") +
+  labs(title="proj_marg vs d_dist") +
+  theme_minimal()
+
+ggplot(data=calibration_z_stack%>%filter(qlogis(pM) < -0.2)) +
+  geom_point(aes(x=d_dist, y=proj_marg, color=diagnosis), alpha=0.8) +
+  xlab("d_dist") +
+  ylab("proj_marg") +
+  labs(title="Confident Region (pM < 0.45): proj_marg vs d_dist") +
+  theme_minimal()
+
+
+```
+
+
+
+```{r}
+
+calibration_z_stack%>%filter(pM < 0.45, diagnosis=="M")%>%arrange(d_dist)%>%select(pM, d_dist, proj_marg)
+
+```
+
+
+```{r}
+
+rf_final <- ranger::ranger(
+      diagnosis ~ .,
+      data = dev%>%select(-id),
+      mtry = 8,
+      min.node.size = 5,
+      keep.inbag = TRUE,
+      probability = TRUE,
+      num.trees = 500
+)
+
+```
+
+```{r}
+
+ref_final <- fit_references_BM(dev)
+
+```
+
+```{r}
+
+dirs_final <- fit_drift_directions(dev, ref_final)
+
+```
+
+```{r}
+
+threshold_final <- list(
+  d_dist_primary = -1.2,
+  proj_marg_secondary = 0
+)
+
+```
+
+
+## Test Set Performance
+
+```{r}
+
+test <- read.csv(here("src","data","bcw","test.csv"))
+
+```
+
+```{r}
+
+test <- test[-1]
+test$diagnosis <- as.factor(test$diagnosis)
+
+```
+
+
+```{r}
+
+test_rf_res <- RFPredict(test, rf_final)
+
+```
+
+```{r}
+
+test_aug <- augment_with_z_and_projections(test, ref_final, dirs_final)
+
+```
+
+```{r}
+
+test_out <- left_join(test_rf_res, test_aug, by="id")
+
+```
+
+
+```{r}
+
+apply_bcw_triage <- function(df, p_hi = 0.65, p_review = 0.45, tau_d = -1.5, tau_p = 0) {
+  df %>%
+    mutate(
+      action = case_when(
+        pM >= p_hi ~ "Malignant",
+        pM > p_review ~ "Review",
+        (pM <= p_review) & (d_dist >= tau_d) & (proj_marg > tau_p) ~ "Review",
+        TRUE ~ "Benign"
+      )
+    )
+}
+
+triage_table <- function(df, truth_col = "diagnosis", action_col = "action") {
+  tab <- table(df[[action_col]], df[[truth_col]])
+  as.data.frame.matrix(tab) %>%
+    tibble::rownames_to_column(action_col)
+}
+
+
+```
+
+```{r}
+
+bcw_test_triaged <- test_out %>%
+  apply_bcw_triage(p_hi = 0.65, p_review = 0.45, tau_d = -1.5, tau_p = 0)
+
+triage_table(bcw_test_triaged, truth_col = "diagnosis", action_col = "action")
+
+
+```
+
+```{r}
+
+bcw_metrics <- function(df, truth_col = "diagnosis") {
+  truth <- df[[truth_col]]
+  stopifnot(all(levels(truth) %in% c("B","M")))
+
+  benign_path <- df %>% filter(action == "Benign")
+  review_path <- df %>% filter(action == "Review")
+  mal_path <- df %>% filter(action == "Malignant")
+
+  tibble(
+    auto_benign_fn_rate = mean(benign_path[[truth_col]] == "M"),
+    fn_capture_rate = 1 - mean(df[[truth_col]] == "M" & df$action == "Benign"),
+    overall_review_rate = mean(df$action == "Review"),
+    benign_region_review_rate = mean(df$pM <= 0.45 & df$action == "Review") / mean(df$pM <= 0.45),
+    malignant_region_fp_override_rate = mean(df$pM >= 0.65 & df[[truth_col]] == "B") / mean(df$pM >= 0.65) # optional
+  )
+}
+
+bcw_metrics(bcw_test_triaged)
+
+
+```
+
+
+
+
+# Dataset 2: Pima Indians Diabetes Dataset
+
+```{r}
+
+pima_import <- read.csv(here("src","data","pima","diabetes.csv"))
+set.seed(42)
+
+```
+
+
+```{r}
+
+pima_import <- pima_import %>%
+  mutate(id = seq_len(n())) %>%
+  mutate(across(-Outcome, as.numeric)) %>%
+  mutate(across(c(Glucose, BloodPressure, SkinThickness, Insulin, BMI),
+                ~ ifelse(.x == 0, median(.x[.x > 0], na.rm=TRUE), .x))) %>%
+  mutate(Outcome = factor(Outcome, levels = c(0,1)))
+
+```
+
+```{r}
+
+
+# pima_train_idx <- createDataPartition(pima_import$Outcome, p = 0.6, list=FALSE)
+# pima_train <- pima_import[pima_train_idx, ]
+# pima_test <- pima_import[-pima_train_idx, ]
+
+
+```
+
+```{r}
+
+# write.csv(pima_train, here("src", "data", "pima", "pima_train.csv"))
+# write.csv(pima_test, here("src", "data", "pima", "pima_test.csv"))
+
+```
+
+```{r}
+
+pima_train <- read.csv(here("src", "data", "pima", "pima_train.csv"))
+pima_test <- read.csv(here("src", "data", "pima", "pima_test.csv"))
+
+```
+
+
+
+```{r}
+
+pima_xgb <- xgb_train_model(pima_train, label_col = "Outcome", positive_label = "1", 
+                                eta = 0.05, max_depth = 4, min_child_weight = 1, subsample = 0.8, colsample_bytree = 0.8, gamma = 0, lambda = 1, alpha = 0, nrounds = 2000, early_stopping_rounds = 50)
+
+```
+
+
+```{r}
+
+pima_refs <- fit_references_BM(pima_train, safe=0, disease=1, diag_col = "Outcome", id_col="id")
+pima_dirs <- fit_drift_directions(pima_train, pima_refs, safe=0, disease=1, diag_col="Outcome", id_col="id")
+
+```
+
+```{r}
+
+pima_test_out <- bind_cols(
+  augment_with_z_and_projections(pima_test, pima_refs, pima_dirs, diag_col="Outcome", id_col="id"),
+  pD=xgb_predict_prob(pima_xgb, pima_test%>%select(-id))
+)
+
+```
+
+```{r}
+
+ggplot(pima_test_out) +
+  geom_boxplot(aes(x=pD, y=Outcome)) +
+  xlab("Pr(Diabetes | x)") +
+  ylab("Outcome") +
+  theme_minimal()
+
+quantile((pima_test_out%>%filter(Outcome==0))$pD, 0.75)
+
+```
+
+```{r}
+
+
+ggplot(pima_test_out) +
+  geom_point(aes(x=qlogis(pD), y=d_dist, color=Outcome)) +
+  xlab("log-odds Pr(Diabetes | x)") +
+  ylab("d_dist") +
+  theme_minimal()
+
+ggplot(pima_test_out) +
+  geom_point(aes(x=qlogis(pD), y=proj_marg, color=Outcome)) +
+  xlab("log-odds Pr(Diabetes | x)") +
+  ylab("proj_marg") +
+  theme_minimal()
+
+ggplot(pima_test_out) +
+  geom_point(aes(x=d_dist, y=proj_marg, color=Outcome)) +
+  xlab("d_dist") +
+  ylab("proj_marg") +
+  theme_minimal()
+
+ggplot(pima_test_out%>%filter(pD < 0.40)) +
+  geom_point(aes(x=d_dist, y=proj_marg, color=Outcome)) +
+  xlab("d_dist (Pr(D | x) < 0.40)") +
+  ylab("proj_marg (Pr(D | x) < 0.40)") +
+  theme_minimal()
+
+
+```
+
+
+```{r}
+
+cm_metrics <- function(pred, truth, positive = "1") {
+  cm <- caret::confusionMatrix(
+    data = factor(pred, levels = levels(truth)),
+    reference = truth,
+    positive = positive,
+    mode = "everything"
+  )
+  
+  # caret returns named metrics; we only keep the ones you care about
+  out <- tibble(
+    accuracy = unname(cm$overall["Accuracy"]),
+    sensitivity = unname(cm$byClass["Sensitivity"]),
+    detection_prevalence = unname(cm$byClass["Detection Prevalence"])
+  )
+  out
+}
+
+evaluate_rules <- function(df, truth_col, rules, positive = "1") {
+  truth <- df[[truth_col]]
+  
+  imap_dfr(rules, function(rule_fn, rule_name) {
+    pred <- rule_fn(df)
+    cm_metrics(pred = pred, truth = truth, positive = positive) %>%
+      mutate(rule = rule_name, .before = 1)
+  }) %>% arrange(desc(sensitivity), detection_prevalence)
+}
+
+```
+
+
+```{r}
+
+make_prob_rule <- function(th) {
+  function(d) factor(ifelse(d$pD >= th, "1", "0"), levels = c("0","1"))
+}
+
+make_geom_rule <- function(th_proj = NULL, th_ddist = NULL) {
+  function(d) {
+    flag <- rep(TRUE, nrow(d))
+    if (!is.null(th_proj))  flag <- flag & (d$proj_marg > th_proj)
+    if (!is.null(th_ddist)) flag <- flag & (d$d_dist > th_ddist)
+    factor(ifelse(flag, "1", "0"), levels = c("0","1"))
+  }
+}
+
+prob_grid <- c(0.05, 0.10, 0.20, 0.30, 0.40)
+geom_grid <- expand.grid(
+  proj = c(0, 0.5, 1.0),
+  ddist = c(0, -0.25, -0.5, -0.75),
+  stringsAsFactors = FALSE
+)
+
+rules_prob <- setNames(lapply(prob_grid, make_prob_rule),
+                       paste0("XGB: pD >= ", prob_grid))
+
+rules_geom <- setNames(
+  lapply(seq_len(nrow(geom_grid)), function(i) {
+    make_geom_rule(th_proj = geom_grid$proj[i], th_ddist = geom_grid$ddist[i])
+  }),
+  paste0("Geom: proj>", geom_grid$proj, " & d_dist>", geom_grid$ddist)
+)
+
+pima_grid_report <- bind_rows(
+  evaluate_rules(pima_test_out, "Outcome", rules_prob, positive = "1") %>% mutate(family="prob"),
+  evaluate_rules(pima_test_out, "Outcome", rules_geom, positive = "1") %>% mutate(family="geom")
+) %>% arrange(desc(sensitivity), detection_prevalence)
+
+pima_grid_report
+
+
+```
+
+```{r}
+
+pima_grid_report %>%
+  filter(sensitivity >= 0.90, detection_prevalence <= 0.70)
+
+
+```
+
+
+## (Optional) BCW Random Forest Hyperparameter Tuning
+
+```{r}
+
+# param_grid <- expand.grid(
+#   mtry = c(4, 8, 16, 25),
+#   min.node.size = c(5, 15)
+# )
+# 
+# tune_out <- rf_cv_tune_uncertainty(
+#   dev = dev,
+#   folds = folds,
+#   param_grid = param_grid,
+#   seed = 42,
+#   verbose = TRUE
+# )
+# 
+# metrics <- tune_out$metrics
+# metrics
+# master_results <- tune_out$master_results
+
+```
+
+
+
+```{r}
+
+# top_combos <- head(metrics, 4)
+# master_results %>%
+#   inner_join(top_combos, by = c("mtry", "min.node.size")) %>%
+#   ggplot(aes(x = pM, y = pM_se)) +
+#   geom_point(alpha = 0.3) +
+#   facet_wrap(~paste0("mtry=", mtry, " | node=", min.node.size)) +
+#   theme_minimal() +
+#   ggtitle("Uncertainty Triangles (Top Combos)")
+# 
+# 
+# bottom_combos <- tail(metrics, 4)
+# master_results %>%
+#   inner_join(bottom_combos, by = c("mtry", "min.node.size")) %>%
+#   ggplot(aes(x = pM, y = pM_se)) +
+#   geom_point(alpha = 0.3) +
+#   facet_wrap(~paste0("mtry=", mtry, " | node=", min.node.size)) +
+#   theme_minimal() +
+#   ggtitle("Uncertainty Triangles (Bottom Combos)")
+
+
+```
+
