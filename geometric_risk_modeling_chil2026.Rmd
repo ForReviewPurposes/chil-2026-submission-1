@@ -366,6 +366,15 @@ pima_test <- read.csv(here("src", "data", "pima", "pima_test.csv"))
 
 ```
 
+```{r}
+
+pima_train <- pima_train[, -1]
+pima_train$Outcome <- as.factor(pima_train$Outcome)
+
+pima_test <- pima_test[, -1]
+pima_test$Outcome <- as.factor(pima_test$Outcome)
+
+```
 
 
 ```{r}
